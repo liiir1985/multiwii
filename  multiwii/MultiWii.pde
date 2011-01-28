@@ -31,8 +31,8 @@ January  2011     V1.
 #define YAW_DIRECTION 1 // if you want to reverse the yaw correction direction
 //#define YAW_DIRECTION -1
 
-#define I2C_SPEED 100000L     //100kHz normal mode, this value must be used for a genuine WMP
-//#define I2C_SPEED 400000L   //400kHz fast mode, it works only with some WMP clones
+//#define I2C_SPEED 100000L     //100kHz normal mode, this value must be used for a genuine WMP
+#define I2C_SPEED 400000L   //400kHz fast mode, it works only with some WMP clones
 
 #define PROMINI  //Arduino type
 //#define MEGA
@@ -61,9 +61,13 @@ January  2011     V1.
 /* I2C accelerometer */
 //#define ADXL345
 //#define BMA020
-//#define BMA180
+#define BMA180
+
 /* I2C barometer */
-//#define BMP085
+#define BMP085
+
+/* I2C magnetometer */
+#define HMC5843
 
 /* ADC accelerometer */ // for 5DOF from sparkfun, uses analog PIN A1/A2/A3
 //#define ADCACC
@@ -73,6 +77,7 @@ January  2011     V1.
 /* Select the right line depending on your radio brand. Feel free to modify the order in your PPM order is different */
 //#define SERIAL_SUM_PPM         PITCH,YAW,THROTTLE,ROLL,AUX1 //For Graupner/Spektrum
 //#define SERIAL_SUM_PPM         ROLL,PITCH,THROTTLE,YAW,AUX1 //For Robe/Hitec/Futaba
+//#define SERIAL_SUM_PPM         PITCH,ROLL,THROTTLE,YAW,AUX1 //For some Hitec/Sanwa/Others
 
 /* interleaving delay in micro seconds between 2 readings WMP/NK in a WMP+NK config */
 /* if the ACC calibration time is very long (20 or 30s), try to increase this delay up to 4000 */
@@ -227,9 +232,12 @@ static int16_t acc_1G = 200;       //this is the 1G measured acceleration (nunch
 static int16_t acc_25deg = 85;     //this is the the ACC value measured on x or y axis for a 25deg inclination (nunchuk) = acc_1G * sin(25)
 static uint8_t accPresent = 0;     //I2C or ADC acc present
 static uint8_t gyroPresent = 0;    //I2C or ADC gyro present
+static uint8_t magPresent = 0;     //I2C or ADC compass present
 static uint8_t barometerPresent = 0;
 static int16_t accADC[3];
 static int16_t gyroADC[3];
+static int16_t magADC[3];
+static int16_t heading;
 static int16_t altitudeSmooth = 0;
 
 // *********************
@@ -533,19 +541,19 @@ void i2c_BMA180_init () {
   i2c_write(0x0D);            // ctrl_reg0
   i2c_write(1<<4);            // Set bit 4 to 1 to enable writing
   i2c_rep_start(0x80+0);       
-  i2c_write(0x30);            // tco_z reg: bits 0-1 to set filtering mode
-  i2c_write(0x01);            // Ultra low noise mode.  Restricted to 300Hz per data sheet
+  i2c_write(0x35);            // 
+  i2c_write(3<<1);            // range set to 3.  2730 1G raw data.  With /10 divisor on acc_ADC, more in line with other sensors and works with the GUI
   i2c_rep_start(0x80+0);
   i2c_write(0x20);            // bw_tcs reg: bits 4-7 to set bw
-  i2c_write(7<<4);            // bw to 1200Hz: (300Hz due to Ultra low noise) see data sheet pg. 28
-  
+  i2c_write(0<<4);            // bw to 10Hz (low pass filter)
+
   acc_1G = 273;
   acc_25deg = 113; // = acc_1G * sin(25 deg)
   accPresent = 1;
 }
 
 void i2c_ACC_getADC () {
-  //TWBR = ((16000000L / 400000L) - 16) / 2;
+  TWBR = ((16000000L / 400000L) - 16) / 2;  // Optional line.  Sensor is good for it in the spec.
   i2c_rep_start(0x80);     // I2C write direction
   i2c_write(0x02);         // Start multiple read at reg 0x02 acc_x_lsb
   i2c_rep_start(0x80 +1);  // I2C read direction => 1
@@ -553,8 +561,8 @@ void i2c_ACC_getADC () {
     rawADC_BMA180[i]=i2c_readAck();}
   rawADC_BMA180[5]= i2c_readNak();
 
-  accADC[ROLL]  =  (((rawADC_BMA180[1]<<8) | (rawADC_BMA180[0]))>>2)/10; 
-  accADC[PITCH] =  (((rawADC_BMA180[3]<<8) | (rawADC_BMA180[2]))>>2)/10;
+  accADC[ROLL]  = - (((rawADC_BMA180[1]<<8) | (rawADC_BMA180[0]))>>2)/10; // opie settings: + ; FFIMU: -
+  accADC[PITCH] = - (((rawADC_BMA180[3]<<8) | (rawADC_BMA180[2]))>>2)/10; // opie settings: + ; FFIMU: -
   accADC[YAW]   = -(((rawADC_BMA180[5]<<8) | (rawADC_BMA180[4]))>>2)/10;
 }
 #endif
@@ -615,17 +623,19 @@ void i2c_ACC_getADC(){
 // **************************
 // I2C Gyroscope ITG3200 
 // **************************
-// I2C adress: 0XD2 (8bit)   0x69 (7bit)
+// I2C adress: 0xD2 (8bit)   0x69 (7bit)  // for sparkfun breakout board default jumper
+// I2C adress: 0xD0 (8bit)   0x68 (7bit)  // for FreeFlight IMU board default jumper
 // principle:
 // 1) VIO is connected to VDD
-// 2) I2C adress is set to 0X69 (AD0 PIN connected to VDD)
+// 2) I2C adress is set to 0x69 (AD0 PIN connected to VDD)
+// or 2) I2C adress is set to 0x68 (AD0 PIN connected to GND)
 // 3) sample rate = 1000Hz ( 1kHz/(div+1) )
 #if defined(ITG3200)
 static uint8_t rawADC_ITG3200[6];
 
 void i2c_ITG3200_init() {
   delay(100);
-  i2c_rep_start(0XD2+0);      // I2C write direction 
+  i2c_rep_start(0XD0+0);      // I2C write direction 
   i2c_write(0x3E);            // Power Management register
   i2c_write(0x80);            //   reset device
   i2c_write(0x16);            // register DLPF_CFG - low pass filter configuration & sample rate
@@ -639,9 +649,9 @@ void i2c_ITG3200_init() {
 void i2c_Gyro_getADC () {
   TWBR = ((16000000L / 400000L) - 16) / 2; // change the I2C clock rate to 400kHz
   
-  i2c_rep_start(0XD2);     // I2C write direction
+  i2c_rep_start(0XD0);     // I2C write direction
   i2c_write(0X1D);         // Start multiple read
-  i2c_rep_start(0XD2 +1);  // I2C read direction => 1
+  i2c_rep_start(0XD0 +1);  // I2C read direction => 1
   for(uint8_t i = 0; i < 5; i++) {
     rawADC_ITG3200[i]=i2c_readAck();}
   rawADC_ITG3200[5]= i2c_readNak();
@@ -651,6 +661,46 @@ void i2c_Gyro_getADC () {
   gyroADC[YAW]   = - ((rawADC_ITG3200[4]<<8) | rawADC_ITG3200[5]);
 }
 #endif
+
+// **************************
+// I2C Compass HMC5843 
+// **************************
+// I2C adress: 0x3C (8bit)   0x1E (7bit)
+// principle:
+// 1)
+#if defined(HMC5843)
+static uint8_t rawADC_HMC5843[6];
+
+void i2c_HMC5843_init() { 
+  delay(100);
+  i2c_rep_start(0X3C+0);      // I2C write direction 
+  i2c_write(0x02);            // Write to Mode register
+  i2c_write(0x00);            //   Continuous-Conversion Mode
+
+  magPresent = 1;  
+}
+
+void i2c_Mag_getADC () {
+  static uint32_t t;
+  
+  if ( (micros()-t )  < 100000 ) return; //each read is spaced by 100ms
+  t = micros();
+
+  TWBR = ((16000000L / 400000L) - 16) / 2; // change the I2C clock rate to 400kHz
+  
+  i2c_rep_start(0X3C);     // I2C write direction
+  i2c_write(0X03);         // Start multiple read
+  i2c_rep_start(0X3C +1);  // I2C read direction => 1
+  for(uint8_t i = 0; i < 5; i++) {
+    rawADC_HMC5843[i]=i2c_readAck();}
+  rawADC_HMC5843[5]= i2c_readNak();
+
+  magADC[PITCH] =   ((rawADC_HMC5843[2]<<8) | rawADC_HMC5843[3]);
+  magADC[ROLL]  =   ((rawADC_HMC5843[0]<<8) | rawADC_HMC5843[1]);
+  magADC[YAW]   = - ((rawADC_HMC5843[4]<<8) | rawADC_HMC5843[5]);
+}
+#endif
+
 
 // **************************
 // I2C Wii Motion Plus 
@@ -732,10 +782,14 @@ uint8_t rawIMU(uint8_t withACC) { //if the WMP or NK are oriented differently, i
       gyroADC[YAW]    = - ( ((rawADC_WMP[3]>>2)<<8) + rawADC_WMP[0] );
       return 1;
     } else if ( (rawADC_WMP[5]&0x02) == 0 && (rawADC_WMP[5]&0x01) == 0) { //nunchuk data
-      accADC[PITCH] = - ( (rawADC_WMP[2]<<2)        + ((rawADC_WMP[5]>>3)&0x2) );
-      accADC[ROLL]  =   ( (rawADC_WMP[3]<<2)        + ((rawADC_WMP[5]>>4)&0x2) );
-      accADC[YAW]   = - ( ((rawADC_WMP[4]&0xFE)<<2) + ((rawADC_WMP[5]>>5)&0x6) );
-      return 0;
+      #if defined(ADXL345) || defined(BMA020) || defined(BMA180) || defined(ADCACC)
+        return 2;
+      #else
+        accADC[PITCH] = - ( (rawADC_WMP[2]<<2)        + ((rawADC_WMP[5]>>3)&0x2) );
+        accADC[ROLL]  =   ( (rawADC_WMP[3]<<2)        + ((rawADC_WMP[5]>>4)&0x2) );
+        accADC[YAW]   = - ( ((rawADC_WMP[4]&0xFE)<<2) + ((rawADC_WMP[5]>>5)&0x6) );
+        return 0;
+      #endif
     } else
       return 2;
   #endif
@@ -780,8 +834,8 @@ uint8_t updateIMU(uint8_t withACC) {
       }
       #if defined(ITG3200)
         gyroADC[PITCH] = ((int32_t)gyroADC[PITCH]  - gyroZero[PITCH])/5/4; // int32_t:  beware of the int16_t overflow !
-        gyroADC[ROLL]  = ((int32_t)gyroADC[ROLL]  - gyroZero[ROLL])/5/4;   // 2000 deg/s => /5 to nearly match the WMP slow mode => /4 to keep the upper 14bits
-        gyroADC[YAW]   = ((int32_t)gyroADC[YAW]  - gyroZero[YAW])/5/4;     // => the ITG3200 is scaled the same way as the WMP (my supposition)
+        gyroADC[ROLL]  = ((int32_t)gyroADC[ROLL]  - gyroZero[ROLL])/5/4;   //
+        gyroADC[YAW]   = ((int32_t)gyroADC[YAW]  - gyroZero[YAW])/5/4;     //
       #else
         gyroADC[PITCH] = gyroADC[PITCH] - gyroZero[PITCH];
         gyroADC[ROLL]  = gyroADC[ROLL]  - gyroZero[ROLL];
@@ -822,13 +876,71 @@ uint8_t updateIMU(uint8_t withACC) {
   return r;
 }
 
+void computeIMU () {
+  uint8_t axis;
+  static int16_t gyroADCprevious[3] = {0,0,0};
+  static int16_t gyroADCp[3] = {0,0,0};
+  int16_t gyroADCinter[3];
+  static int16_t lastAccADC[3] = {0,0,0};
+  static int16_t similarNumberAccData[3];
+  static int16_t gyroDeviation[3];
+  static uint32_t timeInterleave;
+  static int16_t gyroYawSmooth = 0;
+
+  //we separate the 2 situations because reading gyro values with a gyro only setup can be acchieved at a higher rate
+  //gyro+nunchuk: we must wait for a quite high delay betwwen 2 reads to get both WM+ and Nunchuk data. It works with 3ms
+  //gyro only: the delay to read 2 consecutive values can be reduced to only 0.65ms
+  if (nunchukPresent) {
+    annexCode();
+    while((micros()-timeInterleave)<INTERLEAVING_DELAY) ; //interleaving delay between 2 consecutive reads
+    timeInterleave=micros();
+    updateIMU(0);
+    getEstimatedAttitude(); // computation time must last less than one interleaving delay
+    while((micros()-timeInterleave)<INTERLEAVING_DELAY) ; //interleaving delay between 2 consecutive reads
+    timeInterleave=micros();
+    while(updateIMU(0) != 1) ; // For this interleaving reading, we must have a gyro update at this point (less delay)
+
+    for (axis = 0; axis < 3; axis++) {
+      // empirical, we take a weighted value of the current and the previous values
+      gyroData[axis] = (gyroADC[axis]*3+gyroADCprevious[axis]+16)/4/8; // /4 is to average 4 values ; /8 is to reduce the sensibility of gyro
+      gyroADCprevious[axis] = gyroADC[axis];
+    }
+  } else {
+    #if defined(ADXL345) || defined(BMA020) || defined(BMA180) || defined(ADCACC)
+      getEstimatedAttitude();
+      updateIMU(1); //with I2C or ADC ACC
+    #else
+      updateIMU(0); //without ACC
+    #endif
+    for (axis = 0; axis < 3; axis++)
+      gyroADCp[axis] =  gyroADC[axis];
+    timeInterleave=micros();
+    annexCode();
+    while((micros()-timeInterleave)<650) ; //empirical, interleaving delay between 2 consecutive reads
+    updateIMU(0); //without ACC
+    for (axis = 0; axis < 3; axis++) {
+      gyroADCinter[axis] =  gyroADC[axis]+gyroADCp[axis];
+      // empirical, we take a weighted value of the current and the previous values
+      gyroData[axis] = (gyroADCinter[axis]+gyroADCprevious[axis]+12)/3/8; // /3 is to average 3 values ; /8 is to reduce the sensibility of gyro
+      gyroADCprevious[axis] = gyroADCinter[axis]/2;
+      #if not defined (ADXL345) && not defined (BMA020) && not defined (BMA180) && not defined (ADCACC)
+        accADC[axis]=0;
+      #endif
+    }
+  }
+  gyroData[YAW] = (gyroYawSmooth*2+gyroData[YAW]+1)/3;
+  gyroYawSmooth = gyroData[YAW];
+}
+
+
 // ************************************
 // simplified IMU based on Kalman Filter
 // inspired from http://starlino.com/imu_guide.html
 // and http://www.starlino.com/imu_kalman_arduino.html
 // for angles under 25deg, we use an approximation to speed up the angle calculation
+// magnetometer addition for small angles
 // ************************************
-void getEstimatedInclination(){
+void getEstimatedAttitude(){
   int8_t i;  
   float R;
   static float RxEst = 0;      // init acc in stable mode
@@ -843,13 +955,23 @@ void getEstimatedInclination(){
   static uint8_t small_angle=1;
   static uint16_t tCurrent=0,tPrevious=0;
   uint16_t deltaTime;
-  
+  float magX;
+  float magY;
+  float cos_roll = 1;
+  float sin_roll = 0;
+  float cos_pitch = 1;
+  float sin_pitch = 0;
+
   tCurrent = micros();
   deltaTime = tCurrent-tPrevious;
   tPrevious = tCurrent;
 
-  gyroFactor = deltaTime/200e6; //empirical, depends on WMP on IDG datasheet, tied of deg/ms sensibility
-
+  #if defined(ITG3200)
+    gyroFactor = deltaTime/300e6; //empirical
+  #else
+    gyroFactor = deltaTime/200e6; //empirical, depends on WMP on IDG datasheet, tied of deg/ms sensibility
+  #endif
+  
   for (i=0;i<3;i++) accSmooth[i] =(accSmooth[i]*7+accADC[i]+4)/8;
 
   if(accSmooth[YAW] > 0 ){ //we want to be sure we are not flying inverted  
@@ -857,13 +979,25 @@ void getEstimatedInclination(){
     b = gyroADC[PITCH] * gyroFactor;
     
     // a very nice trigonometric approximation:
-    // under 25deg, the error of this approximation is less than 1 deg: angle_axis = arcsin(ACC_axis/ACC_1G) =~= ACC_axis/ACC_1G
+    // under 25deg, the error of this approximation is less than 1 deg:
+    //   sin(x) =~= x =~= arcsin(x)
+    //   angle_axis = arcsin(ACC_axis/ACC_1G) =~= ACC_axis/ACC_1G
     // the angle calculation is much more faster in this case
     if (accSmooth[ROLL]<acc_25deg && accSmooth[ROLL]>-acc_25deg && accSmooth[PITCH]<acc_25deg && accSmooth[PITCH]>-acc_25deg) {
       Axz +=a;
       Ayz +=b;
-      Axz = ((float)accSmooth[ROLL]/acc_1G + Axz*wGyro)*invW;
-      Ayz = ((float)accSmooth[PITCH]/acc_1G + Ayz*wGyro)*invW;
+      Axz = ((float)accSmooth[ROLL]/acc_1G + Axz*wGyro)*invW; // =~= sin_roll
+      Ayz = ((float)accSmooth[PITCH]/acc_1G + Ayz*wGyro)*invW; // =~= sin_pitch
+      
+      #if defined(HMC5843)
+        cos_roll  = 1-Axz*Axz/2; // cos(x) =~= 1-x^2/2
+        cos_pitch = 1-Ayz*Ayz/2;
+        
+        magX = -magADC[PITCH]*cos_pitch+magADC[ROLL]*Axz*Ayz+magADC[YAW]*cos_roll*Ayz;
+        magY = magADC[ROLL]*cos_roll-magADC[YAW]*Axz;
+        heading = degrees(atan2(magY,magX));
+      #endif
+      
       small_angle=1;
     } else {
       //normalize vector (convert to a vector with same direction and with length 1)
@@ -894,61 +1028,6 @@ void getEstimatedInclination(){
   angle[PITCH] =  degrees(Ayz);
 }
 
-void computeIMU () {
-  uint8_t axis;
-  static int16_t gyroADCprevious[3] = {0,0,0};
-  static int16_t gyroADCp[3] = {0,0,0};
-  int16_t gyroADCinter[3];
-  static int16_t lastAccADC[3] = {0,0,0};
-  static int16_t similarNumberAccData[3];
-  static int16_t gyroDeviation[3];
-  static uint32_t timeInterleave;
-  static int16_t gyroYawSmooth = 0;
-
-  //we separate the 2 situations because reading gyro values with a gyro only setup can be acchieved at a higher rate
-  //gyro+nunchuk: we must wait for a quite high delay betwwen 2 reads to get both WM+ and Nunchuk data. It works with 3ms
-  //gyro only: the delay to read 2 consecutive values can be reduced to only 0.65ms
-  if (nunchukPresent) {
-    annexCode();
-    while((micros()-timeInterleave)<INTERLEAVING_DELAY) ; //interleaving delay between 2 consecutive reads
-    timeInterleave=micros();
-    updateIMU(0);
-    getEstimatedInclination(); //getEstimatedInclination computation must last less than one interleaving delay
-    while((micros()-timeInterleave)<INTERLEAVING_DELAY) ; //interleaving delay between 2 consecutive reads
-    timeInterleave=micros();
-    while(updateIMU(0) != 1) ; // For this interleaving reading, we must have a gyro update at this point (less delay)
-
-    for (axis = 0; axis < 3; axis++) {
-      // empirical, we take a weighted value of the current and the previous values
-      gyroData[axis] = (gyroADC[axis]*3+gyroADCprevious[axis]+16)/4/8; // /4 is to average 4 values ; /8 is to reduce the sensibility of gyro
-      gyroADCprevious[axis] = gyroADC[axis];
-    }
-  } else {
-    #if defined(ADXL345) || defined(BMA020) || defined(BMA180) || defined(ADCACC)
-      getEstimatedInclination();
-      updateIMU(1); //with I2C or ADC ACC
-    #else
-      updateIMU(0); //without ACC
-    #endif
-    for (axis = 0; axis < 3; axis++)
-      gyroADCp[axis] =  gyroADC[axis];
-    timeInterleave=micros();
-    annexCode();
-    while((micros()-timeInterleave)<650) ; //empirical, interleaving delay between 2 consecutive reads
-    updateIMU(0); //without ACC
-    for (axis = 0; axis < 3; axis++) {
-      gyroADCinter[axis] =  gyroADC[axis]+gyroADCp[axis];
-      // empirical, we take a weighted value of the current and the previous values
-      gyroData[axis] = (gyroADCinter[axis]+gyroADCprevious[axis]+12)/3/8; // /3 is to average 3 values ; /8 is to reduce the sensibility of gyro
-      gyroADCprevious[axis] = gyroADCinter[axis]/2;
-      #if not defined (ADXL345) && not defined (BMA020) && not defined (BMA180) && not defined (ADCACC)
-        accADC[axis]=0;
-      #endif
-    }
-  }
-  gyroData[YAW] = (gyroYawSmooth*2+gyroData[YAW]+1)/3;
-  gyroYawSmooth = gyroData[YAW];
-}
 
 // *************************
 // motor and servo functions
@@ -1143,7 +1222,7 @@ ISR(TIMER0_COMPB_vect) { //the same with digital PIN 6 and OCR0B counter
 #endif
 
 static uint8_t pinRcChannel[5] = {ROLLPIN, PITCHPIN, YAWPIN, THROTTLEPIN, AUX1PIN};
-volatile uint16_t rcPinValue[8] = {0,0,1000,0,1500,1500,1500,1000}; // interval [1000;2000]
+volatile uint16_t rcPinValue[8] = {1500,1500,1500,1500,1500,1500,1500,1500}; // interval [1000;2000]
 static int16_t rcData[5] ; // interval [1000;2000]
 static int16_t rcCommand[4] ; // interval [1000;2000] for THROTTLE and [-500;+500] for ROLL/PITCH/YAW 
 static int16_t rcHysteresis[5] ;
@@ -1556,12 +1635,7 @@ void setup() {
   POWERPIN_ON
   delay(100);
   i2c_init();
-  #if defined(ITG3200)
-    i2c_ITG3200_init();
-  #else
-    i2c_WMP_init(250);
-  #endif
-  
+  delay(100);
   initIMU();
   
   #if defined(BMP085)
@@ -1579,6 +1653,17 @@ void setup() {
   #if defined(ADCACC)
     adc_ACC_init();
   #endif
+
+  #if defined(HMC5843)
+    i2c_HMC5843_init();
+  #endif
+
+  #if defined(ITG3200)
+    i2c_ITG3200_init();
+  #else
+    i2c_WMP_init(250);
+  #endif
+
   #if defined(BI) || defined(TRI) || defined(SERVO_TILT) || defined(GIMBAL) || defined(FLYING_WING)
     initializeServo();
   #elif (NUMBER_MOTOR == 6) && defined(PROMINI)
@@ -1588,7 +1673,7 @@ void setup() {
   #if defined(GIMBAL) || defined(FLYING_WING)
    calibratingA = 400;
   #else
-    calibratingA = 0;
+    calibratingA = 400; //*****
   #endif
   calibratingG = 400;
 }
@@ -1614,7 +1699,7 @@ void loop () {
       errorGyroI[PITCH] = 0;
       errorGyroI[YAW] = 0;
       rcDelayCommand++;
-      if (rcData[YAW] < MINCHECK && armed == 1) {
+      if ( (rcData[YAW] < MINCHECK || rcData[ROLL] < MINCHECK)  && armed == 1) {
         if (rcDelayCommand == 20) { // rcDelayCommand = 20 => 20x20ms = 0.4s = time to wait for a specific RC command to be acknowledged
           armed = 0;
           writeAllMotors(MINCOMMAND);
@@ -1624,7 +1709,7 @@ void loop () {
           calibratingA=400;
           calibratingG=400;
         }
-      } else if (rcData[YAW] > MAXCHECK && rcData[PITCH] < MAXCHECK && armed == 0 && calibratingG == 0) {
+      } else if ( (rcData[YAW] > MAXCHECK || rcData[ROLL] > MAXCHECK) && rcData[PITCH] < MAXCHECK && armed == 0 && calibratingG == 0) {
         if (rcDelayCommand == 20) {
           armed = 1;
           writeAllMotors(MINTHROTTLE);
@@ -1655,7 +1740,11 @@ void loop () {
     }
     rcTime = currentTime; 
   }
-  
+
+  #if defined(HMC5843)
+    i2c_Mag_getADC();
+  #endif
+
   #if defined(BMP085)
     i2c_BMP085_update();
   #endif
@@ -1704,7 +1793,7 @@ void loop () {
     else if (rcCommand[THROTTLE]+axisPID[YAW] < MINTHROTTLE) axisPID[YAW] = -rcCommand[THROTTLE]+MINTHROTTLE;
     else if (rcCommand[THROTTLE]+axisPID[YAW] > MAXTHROTTLE) axisPID[YAW] = MAXTHROTTLE-rcCommand[THROTTLE];
     else if (rcCommand[THROTTLE]-axisPID[YAW] > MAXTHROTTLE) axisPID[YAW] = -MAXTHROTTLE+rcCommand[THROTTLE];
-    axisPID[YAW] = constrain(axisPID[YAW],-50-abs(rcCommand[YAW]),+50+abs(rcCommand[YAW]));
+    axisPID[YAW] = constrain(axisPID[YAW],-100-abs(rcCommand[YAW]),+100+abs(rcCommand[YAW]));
   #endif
 
   #ifdef BI
@@ -1803,14 +1892,14 @@ void serialCom() {
       for(i=0;i<3;i++) serialize16(accSmooth[i]);
       for(i=0;i<3;i++) serialize16(gyroData[i]);
       serialize16(altitudeSmooth);
-      serialize16(0); // compas
+      serialize16(heading); // compass
       for(i=0;i<4;i++) serialize16(servo[i]);
       for(i=0;i<6;i++) serialize16(motor[i]);
       for(i=0;i<5;i++) serialize16(rcHysteresis[i]);      
       serialize8(nunchukPresent);
       serialize8(accPresent);
       serialize8(barometerPresent);
-      serialize8(0); //i2C_MagnetoPresent
+      serialize8(magPresent);
       serialize8(levelModeParam);
       serialize16(cycleTime);
       for(i=0;i<2;i++) serialize16(angle[i]);
